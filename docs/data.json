@@ -194,6 +194,11 @@
           "name": "Jira Feature Documentation Generator"
         },
         {
+          "description": "Provides secure curl wrapper for the jira:issues-by-component command to prevent token exposure",
+          "id": "jira-issues-by-component",
+          "name": "JIRA Issues by Component - Helper Skill"
+        },
+        {
           "description": "Detailed implementation guide for validating proposed release blockers",
           "id": "jira-validate-blockers",
           "name": "JIRA Release Blocker Validator"

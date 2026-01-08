@@ -36,77 +36,89 @@ This command is particularly useful for:
 
 ## Prerequisites
 
-This command requires JIRA credentials to be configured via the JIRA MCP server setup, even though it uses direct API calls instead of MCP commands.
+This command requires JIRA credentials to be configured as environment variables. It uses direct API calls with a secure wrapper script to prevent token exposure.
 
 ### 1. Install the Jira Plugin
 
 If you haven't already installed the Jira plugin, see the [Jira Plugin README](../README.md#installation) for installation instructions.
 
-### 2. Configure JIRA Credentials via MCP Configuration File
+### 2. Configure JIRA Credentials
 
-**⚠️ Important:** While this command does NOT use MCP commands to query JIRA, it DOES read credentials from the MCP server configuration file. You must configure the MCP server settings even if you're only using this command.
-
-**Why not use MCP commands?** The MCP approach has performance issues when fetching large datasets:
-- Each MCP response must be processed by Claude, consuming tokens
+**Why not use MCP commands?** MCP commands have performance issues when fetching large datasets:
+- Each MCP response must be processed by Claude, consuming LLM tokens
 - Large result sets (even with pagination) cause 413 errors from Claude due to tool result size limits
 - Processing hundreds of tickets through MCP commands creates excessive context usage
 - Direct API calls allow us to stream data to disk without intermediate processing
 
-**Solution:** This command uses `curl` to fetch data directly from JIRA and save to disk, then processes it with Python. It reads JIRA credentials from `~/.config/claude-code/mcp.json` - the same file used by the MCP server.
+**Solution:** This command uses a secure curl wrapper script that:
+- Reads credentials from environment variables
+- Prevents token exposure in process listings or command history
+- Streams data directly to disk for efficient processing
 
-**Required Configuration File Format:**
+**Required Environment Variables:**
 
-Create or edit `~/.config/claude-code/mcp.json`:
+Set the following environment variables:
 
-```json
-{
-  "mcpServers": {
-    "atlassian": {
-      "command": "npx",
-      "args": ["mcp-atlassian"],
-      "env": {
-        "JIRA_URL": "https://issues.redhat.com",
-        "JIRA_USERNAME": "your-email@redhat.com",
-        "JIRA_API_TOKEN": "your-atlassian-api-token-here",
-        "JIRA_PERSONAL_TOKEN": "your-redhat-jira-personal-token-here"
-      }
-    }
-  }
-}
+```bash
+export JIRA_URL="https://issues.redhat.com"
+export JIRA_PERSONAL_TOKEN="your-redhat-jira-personal-token-here"
 ```
 
-**Field Descriptions:**
-- `JIRA_URL`: Your JIRA instance URL (e.g., `https://issues.redhat.com` for Red Hat JIRA)
-- `JIRA_USERNAME`: Your JIRA username/email address
-- `JIRA_API_TOKEN`: Atlassian API token from [Atlassian API Token Management Page](https://id.atlassian.com/manage-profile/security/api-tokens)
-- `JIRA_PERSONAL_TOKEN`: Red Hat JIRA Personal Access Token from [Red Hat Jira PAT Management Page](https://issues.redhat.com/secure/ViewProfile.jspa?selectedTab=com.atlassian.pats.pats-plugin:jira-user-personal-access-tokens)
+**Or for JIRA Cloud:**
+
+```bash
+export JIRA_URL="https://your-domain.atlassian.net"
+export JIRA_API_TOKEN="your-atlassian-api-token-here"
+```
+
+**Getting Your Tokens:**
+- **Red Hat JIRA PAT** (preferred for Red Hat JIRA): [Personal Access Tokens Page](https://issues.redhat.com/secure/ViewProfile.jspa?selectedTab=com.atlassian.pats.pats-plugin:jira-user-personal-access-tokens)
+- **Atlassian API Token** (for JIRA Cloud): [API Token Management](https://id.atlassian.com/manage-profile/security/api-tokens)
+
+**Recommended: Create a credentials file**
+
+To avoid setting variables every time, create `~/.jira-credentials`:
+
+```bash
+# ~/.jira-credentials
+export JIRA_URL="https://issues.redhat.com"
+export JIRA_PERSONAL_TOKEN="your-token-here"
+```
+
+Then make it readable only by you:
+```bash
+chmod 600 ~/.jira-credentials
+```
+
+And source it when needed:
+```bash
+source ~/.jira-credentials
+```
 
 **Note:** The command will use `JIRA_PERSONAL_TOKEN` if available (preferred for Red Hat JIRA), otherwise falls back to `JIRA_API_TOKEN`.
-
-### 3. Verify MCP Server Configuration
-
-See the [backlog command prerequisites](./backlog.md#prerequisites) for complete MCP server setup instructions including the podman containerized approach.
 
 ## Implementation
 
 The command executes the following workflow:
 
-### 1. Extract Credentials from MCP Configuration File
+### 1. Verify Environment Variables
 
-- Read credentials from `~/.config/claude-code/mcp.json`
-- Extract from the `atlassian` MCP server configuration:
+- Check that required environment variables are set:
   ```bash
-  MCP_CONFIG="$HOME/.config/claude-code/mcp.json"
+  if [ -z "${JIRA_URL:-}" ]; then
+    echo "Error: JIRA_URL environment variable is required"
+    echo "Please run: export JIRA_URL='https://issues.redhat.com'"
+    exit 1
+  fi
 
-  JIRA_URL=$(jq -r '.mcpServers.atlassian.env.JIRA_URL' "$MCP_CONFIG")
-  JIRA_EMAIL=$(jq -r '.mcpServers.atlassian.env.JIRA_USERNAME // .mcpServers.atlassian.env.JIRA_EMAIL' "$MCP_CONFIG")
-  JIRA_PERSONAL_TOKEN=$(jq -r '.mcpServers.atlassian.env.JIRA_PERSONAL_TOKEN' "$MCP_CONFIG")
-  JIRA_API_TOKEN=$(jq -r '.mcpServers.atlassian.env.JIRA_API_TOKEN' "$MCP_CONFIG")
-
-  # Use JIRA_PERSONAL_TOKEN if available, otherwise fall back to JIRA_API_TOKEN
-  AUTH_TOKEN="${JIRA_PERSONAL_TOKEN:-$JIRA_API_TOKEN}"
+  if [ -z "${JIRA_PERSONAL_TOKEN:-}" ] && [ -z "${JIRA_API_TOKEN:-}" ]; then
+    echo "Error: JIRA authentication token is required"
+    echo "Please set: export JIRA_PERSONAL_TOKEN='your-token-here'"
+    exit 1
+  fi
   ```
-- If any required credentials are missing or the file doesn't exist, display error message with setup instructions
+- If credentials are missing, display error message with setup instructions from Prerequisites section
+- The wrapper script (`jira_curl.sh`) will handle these checks automatically
 
 ### 2. Parse Arguments and Set Defaults
 
@@ -174,7 +186,7 @@ ORDER BY component ASC, priority DESC, updated DESC
 
 - URL-encode the JQL query for use in API requests
 
-### 4. Fetch All Issues Using curl with Pagination
+### 4. Fetch All Issues Using Secure Curl Wrapper with Pagination
 
 **Fetch Strategy:**
 - Fetch 1000 tickets per request (JIRA's maximum `maxResults` value)
@@ -182,18 +194,30 @@ ORDER BY component ASC, priority DESC, updated DESC
 - Save each batch directly to disk to avoid memory issues
 - Continue until all tickets are fetched
 
-**Authentication:**
-- For Red Hat JIRA (Data Center): Use Bearer token with `JIRA_PERSONAL_TOKEN` (recommended)
-- For JIRA Cloud: Can use Basic Auth with `email:api_token`, but Bearer token also works
+**Security:**
+- Use `jira_curl.sh` wrapper script to prevent token exposure
+- Token is read from environment variables inside the script
+- Never appears in process listings (`ps aux`) or command history
+- Wrapper script path: `plugins/jira/skills/jira-issues-by-component/jira_curl.sh`
 
 **Important API Details:**
 - Use `/rest/api/2/search` endpoint (API v2 works reliably with Red Hat JIRA)
-- Use `Authorization: Bearer ${JIRA_PERSONAL_TOKEN}` header for authentication
+- Wrapper automatically adds `Authorization: Bearer` header
 - Check HTTP response code to detect authentication failures
 - Request fields: `summary,status,priority,assignee,reporter,created,updated,description,labels,components,issuetype`
 
 **Batch Processing Loop:**
 ```bash
+# Get path to secure curl wrapper
+PLUGIN_DIR="plugins/jira/skills/jira-issues-by-component"
+JIRA_CURL="${PLUGIN_DIR}/jira_curl.sh"
+
+# Verify wrapper script exists
+if [ ! -x "$JIRA_CURL" ]; then
+  echo "Error: Secure curl wrapper not found at: $JIRA_CURL"
+  exit 1
+fi
+
 START_AT=0
 BATCH_NUM=0
 TOTAL_FETCHED=0
@@ -201,16 +225,14 @@ TOTAL_FETCHED=0
 while true; do
   # Construct API URL with pagination
   API_URL="${JIRA_URL}/rest/api/2/search?\
-   jql=${ENCODED_JQL}&\
-   startAt=${START_AT}&\
-   maxResults=1000&\
-   fields=summary,status,priority,assignee,reporter,created,updated,description,labels,components,issuetype"
+jql=${ENCODED_JQL}&\
+startAt=${START_AT}&\
+maxResults=1000&\
+fields=summary,status,priority,assignee,reporter,created,updated,description,labels,components,issuetype"
 
-  # Fetch batch using curl with Bearer token authentication
-  HTTP_CODE=$(curl -s -w "%{http_code}" \
+  # Fetch batch using secure wrapper (token not exposed in process list)
+  HTTP_CODE=$("$JIRA_CURL" -s -w "%{http_code}" \
     -o ".work/jira-issues-by-component/${PROJECT_KEY}/batch-${BATCH_NUM}.json" \
-    -H "Authorization: Bearer ${AUTH_TOKEN}" \
-    -H "Accept: application/json" \
     "${API_URL}")
 
   # Check HTTP response code
@@ -242,11 +264,12 @@ echo ""
 echo "✓ Fetching complete: ${TOTAL_FETCHED} issues downloaded in $((BATCH_NUM + 1)) batch(es)"
 ```
 
-**Why curl instead of MCP:**
-- Direct file streaming avoids Claude's tool result size limits (413 errors)
-- Can handle thousands of tickets without token consumption
-- Faster - no intermediate serialization through MCP protocol
-- More reliable for large datasets
+**Why secure wrapper instead of direct curl:**
+- **Security**: Token never exposed in process listings or command history
+- **Reliability**: Direct file streaming avoids Claude's tool result size limits (413 errors)
+- **Performance**: Can handle thousands of tickets without LLM token consumption
+- **Speed**: No intermediate serialization through MCP protocol
+- **Consistency**: Same security pattern as `oc auth` skill
 
 
 ### 5. Generate Output Report
@@ -370,34 +393,39 @@ Load the grouped data and generate the appropriate report based on mode:
 
 ## Error Handling
 
-**Missing credentials file**: If `~/.config/claude-code/mcp.json` doesn't exist:
+**Missing environment variables**: If JIRA_URL is not set:
 ```
-Error: JIRA credentials not configured.
+Error: JIRA_URL environment variable is required
 
-This command requires JIRA credentials from the MCP server configuration file.
-File not found: ~/.config/claude-code/mcp.json
+Please set JIRA credentials:
+  export JIRA_URL='https://issues.redhat.com'
+  export JIRA_PERSONAL_TOKEN='your-token-here'
 
-Please create this file with your JIRA credentials.
-See Prerequisites section for the required mcp.json format and setup instructions.
+Alternatively, source a credentials file:
+  source ~/.jira-credentials
 ```
 
-**Invalid credentials in file**: If credentials are missing from mcp.json:
+**Missing authentication token**: If neither JIRA_PERSONAL_TOKEN nor JIRA_API_TOKEN is set:
 ```
-Error: JIRA credentials incomplete in ~/.config/claude-code/mcp.json
+Error: JIRA authentication token is required
 
-Required fields in .mcpServers.atlassian.env:
-- JIRA_URL (e.g., https://issues.redhat.com)
-- JIRA_USERNAME (your JIRA email/username)
-- JIRA_PERSONAL_TOKEN (preferred) or JIRA_API_TOKEN
+Please set either:
+  export JIRA_PERSONAL_TOKEN='your-token-here'  # Preferred for Red Hat JIRA
+  export JIRA_API_TOKEN='your-token-here'       # For JIRA Cloud
 
-See Prerequisites section for the required mcp.json format.
+Get your token from:
+  - Red Hat JIRA PAT: https://issues.redhat.com/secure/ViewProfile.jspa?...
+  - Atlassian API Token: https://id.atlassian.com/manage-profile/security/api-tokens
 ```
 
 **Authentication failure**: If curl returns 401/403:
 ```
 Error: JIRA authentication failed (HTTP 401/403)
 
-Please verify your JIRA credentials in ~/.config/claude-code/mcp.json
+Please verify your JIRA credentials:
+1. Check that JIRA_URL is correct: echo $JIRA_URL
+2. Check that your token is valid and not expired
+3. Try generating a new token from the JIRA web interface
 ```
 
 **Invalid project key**: Display error with example format
@@ -437,7 +465,17 @@ Available components:
 
 ## Examples
 
-**Note:** All examples require JIRA credentials to be configured in `~/.config/claude-code/mcp.json` (see Prerequisites section).
+**Note:** All examples require JIRA credentials to be set as environment variables (see Prerequisites section).
+
+**Before running any examples, set your credentials:**
+```bash
+# Option 1: Export directly
+export JIRA_URL="https://issues.redhat.com"
+export JIRA_PERSONAL_TOKEN="your-token-here"
+
+# Option 2: Source from credentials file
+source ~/.jira-credentials
+```
 
 ### Overview Mode Examples
 
